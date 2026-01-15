@@ -1,59 +1,60 @@
 from fastapi import FastAPI, Query, HTTPException
-import yt_dlp
+import aiohttp
+import re
+import json
 
-app = FastAPI()
+app = FastAPI(title="Cloud Safe YouTube Search API")
 
-YDL_OPTS_SEARCH = {
-    "quiet": True,
-    "skip_download": True,
-    "extract_flat": True,
-    "nocheckcertificate": True,
-    "geo_bypass": True,
-    "user_agent": (
-        "Mozilla/5.0 (Linux; Android 10; SM-G975F) "
+YOUTUBE_SEARCH_URL = "https://www.youtube.com/results?search_query="
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/114.0 Mobile Safari/537.36"
+        "Chrome/120.0 Safari/537.36"
     ),
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android"],
-            "player_skip": ["webpage"]
-        }
-    }
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
-YDL_OPTS_FULL = {
-    "quiet": True,
-    "skip_download": True,
-    "nocheckcertificate": True,
-    "geo_bypass": True,
-    "user_agent": YDL_OPTS_SEARCH["user_agent"],
-    "extractor_args": YDL_OPTS_SEARCH["extractor_args"]
-}
+
+def extract_json(html: str):
+    match = re.search(r"var ytInitialData = (.*?);</script>", html)
+    if not match:
+        return None
+    return json.loads(match.group(1))
 
 
 @app.get("/search")
-async def search_youtube(title: str = Query(...)):
+async def search(title: str = Query(...)):
     try:
-        # Step 1: Search
-        with yt_dlp.YoutubeDL(YDL_OPTS_SEARCH) as ydl:
-            search = ydl.extract_info(f"ytsearch1:{title}", download=False)
-            entry = search["entries"][0]
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(YOUTUBE_SEARCH_URL + title) as resp:
+                html = await resp.text()
 
-        # Step 2: Full metadata
-        with yt_dlp.YoutubeDL(YDL_OPTS_FULL) as ydl:
-            info = ydl.extract_info(entry["url"], download=False)
+        data = extract_json(html)
+        if not data:
+            raise Exception("ytInitialData not found")
 
-        return {
-            "playlist": False,
-            "title": info.get("title"),
-            "link": info.get("webpage_url"),
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail")
-        }
+        contents = (
+            data["contents"]["twoColumnSearchResultsRenderer"]
+            ["primaryContents"]["sectionListRenderer"]["contents"][0]
+            ["itemSectionRenderer"]["contents"]
+        )
+
+        for item in contents:
+            if "videoRenderer" in item:
+                v = item["videoRenderer"]
+                video_id = v["videoId"]
+
+                return {
+                    "playlist": False,
+                    "title": "".join(r["text"] for r in v["title"]["runs"]),
+                    "link": f"https://www.youtube.com/watch?v={video_id}",
+                    "duration": v["lengthText"]["simpleText"],
+                    "thumbnail": v["thumbnail"]["thumbnails"][-1]["url"]
+                }
+
+        raise Exception("No video found")
 
     except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"YouTube extraction failed: {str(e)}"
-)
+        raise HTTPException(status_code=500, detail=str(e))
